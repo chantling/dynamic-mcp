@@ -9,6 +9,9 @@ const DEFAULT_TOOL_TIMEOUT_SECS: u64 = 30;
 /// Default resource/prompt call timeout in seconds
 const DEFAULT_RESOURCE_PROMPT_TIMEOUT_SECS: u64 = 10;
 
+/// Default initialization/connection timeout in seconds
+const DEFAULT_INIT_TIMEOUT_SECS: u64 = 10;
+
 /// Parse a duration string like "30s", "1min", "3000ms" into a Duration
 fn parse_duration(s: &str) -> Result<Duration, String> {
     let s = s.trim().to_lowercase();
@@ -77,6 +80,8 @@ pub struct Timeout {
     pub resources: Option<Duration>,
     #[serde(default, deserialize_with = "deserialize_resource_prompt_timeout")]
     pub prompts: Option<Duration>,
+    #[serde(default, deserialize_with = "deserialize_tools_timeout")]
+    pub init: Option<Duration>,
 }
 
 /// Custom deserializer for tools timeout that accepts Duration or string
@@ -138,9 +143,15 @@ impl Timeout {
             .unwrap_or_else(|| Duration::from_secs(DEFAULT_RESOURCE_PROMPT_TIMEOUT_SECS))
     }
 
+    /// Get the initialization/connection timeout, returning the default if not configured
+    pub fn init_timeout(&self) -> Duration {
+        self.init
+            .unwrap_or_else(|| Duration::from_secs(DEFAULT_INIT_TIMEOUT_SECS))
+    }
+
     /// Returns true if all timeouts are using defaults (None)
     pub fn is_default(&self) -> bool {
-        self.tools.is_none() && self.resources.is_none() && self.prompts.is_none()
+        self.tools.is_none() && self.resources.is_none() && self.prompts.is_none() && self.init.is_none()
     }
 }
 
@@ -414,6 +425,14 @@ impl McpServerConfig {
             McpServerConfig::Stdio { timeout, .. } => timeout.prompt_timeout(),
             McpServerConfig::Http { timeout, .. } => timeout.prompt_timeout(),
             McpServerConfig::Sse { timeout, .. } => timeout.prompt_timeout(),
+        }
+    }
+
+    pub fn init_timeout(&self) -> Duration {
+        match self {
+            McpServerConfig::Stdio { timeout, .. } => timeout.init_timeout(),
+            McpServerConfig::Http { timeout, .. } => timeout.init_timeout(),
+            McpServerConfig::Sse { timeout, .. } => timeout.init_timeout(),
         }
     }
 }

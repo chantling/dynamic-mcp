@@ -115,54 +115,60 @@ async fn run_server(config_path: String, config_source: &str) -> Result<()> {
     // Validate initial config
     config::load_config(&config_path).await?;
 
-    // Initial load - spawn in background to avoid blocking stdio
-    let client_init = client.clone();
-    let config_path_init = config_path.clone();
-    tokio::spawn(async move {
+    // Load config and connect to all upstream servers before starting stdio listener
+    {
+        let client_init = client.clone();
+        let config_path_init = config_path.clone();
         if let Ok(config) = config::load_config(&config_path_init).await {
-            let servers: Vec<_> = config
-                .mcp_servers
-                .into_iter()
-                .filter(|(_, server_config)| {
-                    if !server_config.is_enabled() {
-                        tracing::info!("⊘ Server is disabled, skipping connection");
-                    }
-                    server_config.is_enabled()
-                })
-                .collect();
+        let servers: Vec<_> = config
+            .mcp_servers
+            .into_iter()
+            .filter(|(_, server_config)| {
+                if !server_config.is_enabled() {
+                    tracing::info!("⊘ Server is disabled, skipping connection");
+                }
+                server_config.is_enabled()
+            })
+            .collect();
 
-            let handles: Vec<_> = servers
-                .into_iter()
-                .map(|(group_name, server_config)| {
-                    let client = client_init.clone();
-                    tokio::spawn(async move {
-                        let res = {
+        let handles: Vec<_> = servers
+            .into_iter()
+            .map(|(group_name, server_config)| {
+                let client = client_init.clone();
+                tokio::spawn(async move {
+                    // Connect without holding the client lock - each server runs its own
+                    // connection independently so they connect in true parallel
+                    let mut temp_client = crate::proxy::ModularMcpClient::new();
+                    let res = temp_client
+                        .connect(group_name.clone(), server_config.clone())
+                        .await;
+
+                    // Now acquire lock briefly to register the result
+                    match res {
+                        Ok(_) => {
                             let mut client_lock = client.write().await;
-                            client_lock
-                                .connect(group_name.clone(), server_config.clone())
-                                .await
-                        };
-                        match res {
-                            Ok(_) => Ok(group_name),
-                            Err(e) => {
-                                let mut client_lock = client.write().await;
-                                client_lock.record_failed_connection(
-                                    group_name.clone(),
-                                    server_config,
-                                    e,
-                                );
-                                Err(group_name)
-                            }
+                            client_lock.merge_group(&group_name, temp_client);
+                            Ok(group_name)
                         }
-                    })
+                        Err(e) => {
+                            let mut client_lock = client.write().await;
+                            client_lock.record_failed_connection(
+                                group_name.clone(),
+                                server_config,
+                                e,
+                            );
+                            Err(group_name)
+                        }
+                    }
                 })
-                .collect();
+            })
+            .collect();
 
-            for handle in handles {
-                let _ = handle.await;
-            }
+        for handle in handles {
+            let _ = handle.await;
         }
-    });
+        }
+    }
 
     // Spawn periodic retry handler for failed connections
     let client_retry = client.clone();

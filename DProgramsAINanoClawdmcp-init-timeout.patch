@@ -1,0 +1,286 @@
+diff --git a/README.md b/README.md
+index b75d399..03ebb1f 100644
+--- a/README.md
++++ b/README.md
+@@ -354,11 +354,12 @@ Use the optional `enabled` field to disable a specific server without removing i
+ 
+ ### Timeout Configuration
+ 
+-Configure custom timeouts for tool, resource, and prompt calls per server using the optional `timeout` field. By default:
++Configure custom timeouts for tool, resource, prompt, and initialization calls per server using the optional `timeout` field. By default:
+ 
+ - Tool calls: 30 seconds
+ - Resource calls: 10 seconds
+ - Prompt calls: 10 seconds
++- Initialization (transport creation, initialize handshake, tools list): 10 seconds
+ 
+ You can customize these for servers that need more time:
+ 
+@@ -372,7 +373,8 @@ You can customize these for servers that need more time:
+       "timeout": {
+         "tools": "1min",
+         "resources": "30s",
+-        "prompts": "30s"
++        "prompts": "30s",
++        "init": "15s"
+       }
+     }
+   }
+@@ -390,9 +392,10 @@ You can customize these for servers that need more time:
+ 
+ **Behavior:**
+ 
+-- If `timeout` is omitted, defaults are used (tools: 30s, resources: 10s, prompts: 10s)
++- If `timeout` is omitted, defaults are used (tools: 30s, resources: 10s, prompts: 10s, init: 10s)
+ - Individual timeout fields default to their respective defaults if not specified
+-- Applies only to tool/resource/prompt call operations, not to connection or initialization
++- The `init` timeout covers transport creation, MCP initialize handshake, and initial tools list — useful for servers that do heavy startup work (database warmup, file indexing, etc.) before accepting MCP requests
++- Tool/resource/prompt timeouts apply only to call operations after connection is established
+ - Useful for servers with long-running operations (database queries, file processing, etc.)
+ 
+ ## Troubleshooting
+@@ -403,7 +406,7 @@ You can customize these for servers that need more time:
+ 
+ **Solutions**:
+ 
+-- **Connection timeout**: Each server has 10-second timeout for transport creation, initialization, and tool listing
++- **Connection timeout**: Each server has a configurable init timeout (default 10s) for transport creation, initialization, and tool listing. Increase it with `"timeout": { "init": "30s" }` for servers that do heavy startup work
+ - **Automatic retry**: Failed servers are retried up to 3 times with exponential backoff (2s, 4s, 8s)
+ - **Periodic retry**: Failed servers are retried every 30 seconds in the background
+ - **Slow HTTP servers**: If remote HTTP/SSE servers are slow, they'll timeout and be retried automatically
+diff --git a/src/config/schema.rs b/src/config/schema.rs
+index e895178..7052e39 100644
+--- a/src/config/schema.rs
++++ b/src/config/schema.rs
+@@ -9,6 +9,9 @@ const DEFAULT_TOOL_TIMEOUT_SECS: u64 = 30;
+ /// Default resource/prompt call timeout in seconds
+ const DEFAULT_RESOURCE_PROMPT_TIMEOUT_SECS: u64 = 10;
+ 
++/// Default initialization/connection timeout in seconds
++const DEFAULT_INIT_TIMEOUT_SECS: u64 = 10;
++
+ /// Parse a duration string like "30s", "1min", "3000ms" into a Duration
+ fn parse_duration(s: &str) -> Result<Duration, String> {
+     let s = s.trim().to_lowercase();
+@@ -77,6 +80,8 @@ pub struct Timeout {
+     pub resources: Option<Duration>,
+     #[serde(default, deserialize_with = "deserialize_resource_prompt_timeout")]
+     pub prompts: Option<Duration>,
++    #[serde(default, deserialize_with = "deserialize_tools_timeout")]
++    pub init: Option<Duration>,
+ }
+ 
+ /// Custom deserializer for tools timeout that accepts Duration or string
+@@ -138,9 +143,15 @@ impl Timeout {
+             .unwrap_or_else(|| Duration::from_secs(DEFAULT_RESOURCE_PROMPT_TIMEOUT_SECS))
+     }
+ 
++    /// Get the initialization/connection timeout, returning the default if not configured
++    pub fn init_timeout(&self) -> Duration {
++        self.init
++            .unwrap_or_else(|| Duration::from_secs(DEFAULT_INIT_TIMEOUT_SECS))
++    }
++
+     /// Returns true if all timeouts are using defaults (None)
+     pub fn is_default(&self) -> bool {
+-        self.tools.is_none() && self.resources.is_none() && self.prompts.is_none()
++        self.tools.is_none() && self.resources.is_none() && self.prompts.is_none() && self.init.is_none()
+     }
+ }
+ 
+@@ -416,6 +427,14 @@ impl McpServerConfig {
+             McpServerConfig::Sse { timeout, .. } => timeout.prompt_timeout(),
+         }
+     }
++
++    pub fn init_timeout(&self) -> Duration {
++        match self {
++            McpServerConfig::Stdio { timeout, .. } => timeout.init_timeout(),
++            McpServerConfig::Http { timeout, .. } => timeout.init_timeout(),
++            McpServerConfig::Sse { timeout, .. } => timeout.init_timeout(),
++        }
++    }
+ }
+ 
+ #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+diff --git a/src/main.rs b/src/main.rs
+index d82e1f4..a6183ab 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -115,54 +115,60 @@ async fn run_server(config_path: String, config_source: &str) -> Result<()> {
+     // Validate initial config
+     config::load_config(&config_path).await?;
+ 
+-    // Initial load - spawn in background to avoid blocking stdio
+-    let client_init = client.clone();
+-    let config_path_init = config_path.clone();
+-    tokio::spawn(async move {
++    // Load config and connect to all upstream servers before starting stdio listener
++    {
++        let client_init = client.clone();
++        let config_path_init = config_path.clone();
+         if let Ok(config) = config::load_config(&config_path_init).await {
+-            let servers: Vec<_> = config
+-                .mcp_servers
+-                .into_iter()
+-                .filter(|(_, server_config)| {
+-                    if !server_config.is_enabled() {
+-                        tracing::info!("⊘ Server is disabled, skipping connection");
+-                    }
+-                    server_config.is_enabled()
+-                })
+-                .collect();
+-
+-            let handles: Vec<_> = servers
+-                .into_iter()
+-                .map(|(group_name, server_config)| {
+-                    let client = client_init.clone();
+-                    tokio::spawn(async move {
+-                        let res = {
++        let servers: Vec<_> = config
++            .mcp_servers
++            .into_iter()
++            .filter(|(_, server_config)| {
++                if !server_config.is_enabled() {
++                    tracing::info!("⊘ Server is disabled, skipping connection");
++                }
++                server_config.is_enabled()
++            })
++            .collect();
++
++        let handles: Vec<_> = servers
++            .into_iter()
++            .map(|(group_name, server_config)| {
++                let client = client_init.clone();
++                tokio::spawn(async move {
++                    // Connect without holding the client lock - each server runs its own
++                    // connection independently so they connect in true parallel
++                    let mut temp_client = crate::proxy::ModularMcpClient::new();
++                    let res = temp_client
++                        .connect(group_name.clone(), server_config.clone())
++                        .await;
++
++                    // Now acquire lock briefly to register the result
++                    match res {
++                        Ok(_) => {
+                             let mut client_lock = client.write().await;
+-                            client_lock
+-                                .connect(group_name.clone(), server_config.clone())
+-                                .await
+-                        };
+-                        match res {
+-                            Ok(_) => Ok(group_name),
+-                            Err(e) => {
+-                                let mut client_lock = client.write().await;
+-                                client_lock.record_failed_connection(
+-                                    group_name.clone(),
+-                                    server_config,
+-                                    e,
+-                                );
+-                                Err(group_name)
+-                            }
++                            client_lock.merge_group(&group_name, temp_client);
++                            Ok(group_name)
+                         }
+-                    })
++                        Err(e) => {
++                            let mut client_lock = client.write().await;
++                            client_lock.record_failed_connection(
++                                group_name.clone(),
++                                server_config,
++                                e,
++                            );
++                            Err(group_name)
++                        }
++                    }
+                 })
+-                .collect();
++            })
++            .collect();
+ 
+-            for handle in handles {
+-                let _ = handle.await;
+-            }
++        for handle in handles {
++            let _ = handle.await;
+         }
+-    });
++        }
++    }
+ 
+     // Spawn periodic retry handler for failed connections
+     let client_retry = client.clone();
+diff --git a/src/proxy/client.rs b/src/proxy/client.rs
+index 30689e4..1c9760f 100644
+--- a/src/proxy/client.rs
++++ b/src/proxy/client.rs
+@@ -34,6 +34,15 @@ impl ModularMcpClient {
+         }
+     }
+ 
++    /// Transfer a connected group from a temporary client into this client.
++    /// Used for parallel connection: each server connects independently,
++    /// then the result is merged into the shared client.
++    pub fn merge_group(&mut self, group_name: &str, source: ModularMcpClient) {
++        if let Some(group_state) = source.groups.into_iter().next() {
++            self.groups.insert(group_name.to_string(), group_state.1);
++        }
++    }
++
+     pub async fn connect(&mut self, group_name: String, config: McpServerConfig) -> Result<()> {
+         if self.groups.contains_key(&group_name) {
+             return Ok(());
+@@ -42,8 +51,10 @@ impl ModularMcpClient {
+         let description = config.description().to_string();
+ 
+         let config_to_use = config.clone();
++        let init_timeout = config_to_use.init_timeout();
++        tracing::info!("Connecting to {} with init timeout: {:?}", group_name, init_timeout);
+         let transport = tokio::time::timeout(
+-            Duration::from_secs(5),
++            init_timeout,
+             Transport::new(&config_to_use, &group_name),
+         )
+         .await
+@@ -60,7 +71,7 @@ impl ModularMcpClient {
+         }));
+ 
+         let response = tokio::time::timeout(
+-            Duration::from_secs(5),
++            init_timeout,
+             transport.send_request(&init_request),
+         )
+         .await
+@@ -93,7 +104,7 @@ impl ModularMcpClient {
+             }));
+ 
+             let retry_response = tokio::time::timeout(
+-                Duration::from_secs(5),
++                init_timeout,
+                 transport.send_request(&retry_request),
+             )
+             .await
+@@ -124,7 +135,7 @@ impl ModularMcpClient {
+         let tools = if config.features().tools {
+             let list_tools_request = JsonRpcRequest::new(3, "tools/list");
+             let tools_response = tokio::time::timeout(
+-                Duration::from_secs(5),
++                init_timeout,
+                 transport.send_request(&list_tools_request),
+             )
+             .await
+diff --git a/src/proxy/transport.rs b/src/proxy/transport.rs
+index 6ba8cf0..e90aebe 100644
+--- a/src/proxy/transport.rs
++++ b/src/proxy/transport.rs
+@@ -48,8 +48,8 @@ impl StdioTransport {
+         #[cfg(windows)]
+         {
+             // CREATE_NEW_PROCESS_GROUP = 0x00000200
+-            // This allows us to send Ctrl+C/Ctrl+Break to the entire process tree
+-            cmd.creation_flags(0x00000200);
++            // Disabled - interferes with Python asyncio ProactorEventLoop on Windows
++            // cmd.creation_flags(0x00000200);
+         }
+ 
+         let mut child = cmd

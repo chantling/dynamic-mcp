@@ -354,11 +354,12 @@ Use the optional `enabled` field to disable a specific server without removing i
 
 ### Timeout Configuration
 
-Configure custom timeouts for tool, resource, and prompt calls per server using the optional `timeout` field. By default:
+Configure custom timeouts for tool, resource, prompt, and initialization calls per server using the optional `timeout` field. By default:
 
 - Tool calls: 30 seconds
 - Resource calls: 10 seconds
 - Prompt calls: 10 seconds
+- Initialization (transport creation, initialize handshake, tools list): 10 seconds
 
 You can customize these for servers that need more time:
 
@@ -372,7 +373,8 @@ You can customize these for servers that need more time:
       "timeout": {
         "tools": "1min",
         "resources": "30s",
-        "prompts": "30s"
+        "prompts": "30s",
+        "init": "15s"
       }
     }
   }
@@ -390,9 +392,10 @@ You can customize these for servers that need more time:
 
 **Behavior:**
 
-- If `timeout` is omitted, defaults are used (tools: 30s, resources: 10s, prompts: 10s)
+- If `timeout` is omitted, defaults are used (tools: 30s, resources: 10s, prompts: 10s, init: 10s)
 - Individual timeout fields default to their respective defaults if not specified
-- Applies only to tool/resource/prompt call operations, not to connection or initialization
+- The `init` timeout covers transport creation, MCP initialize handshake, and initial tools list — useful for servers that do heavy startup work (database warmup, file indexing, etc.) before accepting MCP requests
+- Tool/resource/prompt timeouts apply only to call operations after connection is established
 - Useful for servers with long-running operations (database queries, file processing, etc.)
 
 ## Troubleshooting
@@ -403,7 +406,7 @@ You can customize these for servers that need more time:
 
 **Solutions**:
 
-- **Connection timeout**: Each server has 10-second timeout for transport creation, initialization, and tool listing
+- **Connection timeout**: Each server has a configurable init timeout (default 10s) for transport creation, initialization, and tool listing. Increase it with `"timeout": { "init": "30s" }` for servers that do heavy startup work
 - **Automatic retry**: Failed servers are retried up to 3 times with exponential backoff (2s, 4s, 8s)
 - **Periodic retry**: Failed servers are retried every 30 seconds in the background
 - **Slow HTTP servers**: If remote HTTP/SSE servers are slow, they'll timeout and be retried automatically
