@@ -6,9 +6,9 @@
       "type": "local"
     }
   },
-  "model": "minimax-coding-plan/MiniMax-M2.5",
+  "model": "minimax-coding-plan/MiniMax-M2.7",
   "plugin": [
-    "oh-my-opencode@3.5.3",
+    "oh-my-opencode",
     "opencode-pty",
     "opencode-scheduler"
   ]
