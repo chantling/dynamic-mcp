@@ -34,6 +34,15 @@ impl ModularMcpClient {
         }
     }
 
+    /// Transfer a connected group from a temporary client into this client.
+    /// Used for parallel connection: each server connects independently,
+    /// then the result is merged into the shared client.
+    pub fn merge_group(&mut self, group_name: &str, source: ModularMcpClient) {
+        if let Some(group_state) = source.groups.into_iter().next() {
+            self.groups.insert(group_name.to_string(), group_state.1);
+        }
+    }
+
     pub async fn connect(&mut self, group_name: String, config: McpServerConfig) -> Result<()> {
         if self.groups.contains_key(&group_name) {
             return Ok(());
@@ -42,8 +51,10 @@ impl ModularMcpClient {
         let description = config.description().to_string();
 
         let config_to_use = config.clone();
+        let init_timeout = config_to_use.init_timeout();
+        tracing::info!("Connecting to {} with init timeout: {:?}", group_name, init_timeout);
         let transport = tokio::time::timeout(
-            Duration::from_secs(5),
+            init_timeout,
             Transport::new(&config_to_use, &group_name),
         )
         .await
@@ -60,7 +71,7 @@ impl ModularMcpClient {
         }));
 
         let response = tokio::time::timeout(
-            Duration::from_secs(5),
+            init_timeout,
             transport.send_request(&init_request),
         )
         .await
@@ -93,7 +104,7 @@ impl ModularMcpClient {
             }));
 
             let retry_response = tokio::time::timeout(
-                Duration::from_secs(5),
+                init_timeout,
                 transport.send_request(&retry_request),
             )
             .await
@@ -124,7 +135,7 @@ impl ModularMcpClient {
         let tools = if config.features().tools {
             let list_tools_request = JsonRpcRequest::new(3, "tools/list");
             let tools_response = tokio::time::timeout(
-                Duration::from_secs(5),
+                init_timeout,
                 transport.send_request(&list_tools_request),
             )
             .await

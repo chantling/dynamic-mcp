@@ -48,8 +48,8 @@ impl StdioTransport {
         #[cfg(windows)]
         {
             // CREATE_NEW_PROCESS_GROUP = 0x00000200
-            // This allows us to send Ctrl+C/Ctrl+Break to the entire process tree
-            cmd.creation_flags(0x00000200);
+            // Disabled - interferes with Python asyncio ProactorEventLoop on Windows
+            // cmd.creation_flags(0x00000200);
         }
 
         let mut child = cmd
