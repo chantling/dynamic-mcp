@@ -96,7 +96,32 @@ impl StdioTransport {
             }
 
             match serde_json::from_str::<JsonRpcResponse>(trimmed) {
-                Ok(response) => return Ok(response),
+                Ok(response) => {
+                    // Only accept the response belonging to THIS request.
+                    //
+                    // Requests are dispatched strictly serially (see
+                    // server.rs run_stdio), so a response with a different
+                    // id can only be an orphan left behind by an earlier
+                    // request whose read side was cancelled by the tool
+                    // timeout while the server kept processing it.
+                    // Delivering such an orphan to the next caller is what
+                    // caused tools to receive results for previous,
+                    // unrelated requests (e.g. a transcript of the
+                    // previously transcribed video).
+                    //
+                    // If dispatch ever becomes concurrent, replace this
+                    // with a dedicated reader task that routes responses
+                    // by id into per-request channels instead.
+                    if response.id == request.id {
+                        return Ok(response);
+                    }
+                    tracing::warn!(
+                        "Discarding orphaned response with id {} (expected {}): \
+                         it belongs to a previous, already-timed-out request",
+                        response.id, request.id
+                    );
+                    continue;
+                }
                 Err(e) => {
                     if let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) {
                         if value.get("error").is_some() {
@@ -110,9 +135,17 @@ impl StdioTransport {
                                 );
                                 continue;
                             }
+                            let id_value = id_value.unwrap();
+                            if id_value != request.id {
+                                tracing::warn!(
+                                    "Discarding orphaned error response with id {} (expected {})",
+                                    id_value, request.id
+                                );
+                                continue;
+                            }
                             return Ok(JsonRpcResponse {
                                 jsonrpc: "2.0".to_string(),
-                                id: id_value.unwrap(),
+                                id: id_value,
                                 result: None,
                                 error: serde_json::from_value(value.get("error").unwrap().clone())
                                     .ok(),
